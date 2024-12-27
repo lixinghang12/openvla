@@ -8,7 +8,7 @@ import copy
 import inspect
 import json
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import dlimp as dl
 import numpy as np
@@ -257,7 +257,11 @@ def apply_trajectory_transforms(
     train: bool,
     goal_relabeling_strategy: Optional[str] = None,
     goal_relabeling_kwargs: dict = {},
+    chunk_action: bool=True,
+    frame_num: int=-1,    
     window_size: int = 1,
+    left_pad: bool=True,
+    window_sample: Literal["sliding", "range"]="sliding",
     future_action_window_size: int = 0,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
@@ -266,6 +270,7 @@ def apply_trajectory_transforms(
     task_augment_strategy: Optional[str] = None,
     task_augment_kwargs: dict = {},
     num_parallel_calls: int = tf.data.AUTOTUNE,
+    filter_langs=False
 ) -> dl.DLataset:
     """
     Applies common transforms that happen at a trajectory level. Such transforms are usually some sort of "relabeling"
@@ -310,7 +315,89 @@ def apply_trajectory_transforms(
     if max_proprio is not None and "proprio" in dataset.element_spec["observation"]:
         dataset = dataset.filter(lambda x: tf.math.reduce_all(tf.math.abs(x["observation"]["proprio"]) <= max_proprio))
 
-    # marks which entires of the observation and task dicts are padding
+    if chunk_action and not left_pad:
+        dataset = dataset.filter(lambda x: window_size <= len(x['action']))
+    elif not chunk_action:
+        assert frame_num != -1
+        dataset = dataset.filter(lambda x: frame_num <= len(x['action']))
+    
+    if filter_langs:
+        def language_filter(lang):
+            lang = lang.lower()
+            if lang == "pick coke can":
+                return True
+            if "place apple into top drawer" in lang:
+                return True
+            if 'move'in lang and 'near' in lang:
+                obj_list = ['blue plastic bottle', 'pepsi can', 'orange']
+                cnt = 0
+                for obj in obj_list:
+                    if obj in lang:
+                        cnt += 1
+                if cnt == 2:
+                    return True
+                
+                obj_list = ["7up can", "apple", "sponge"]
+                cnt = 0
+                for obj in obj_list:
+                    if obj in lang:
+                        cnt += 1
+                if cnt == 2:
+                    return True
+                
+                obj_list = ["coke can", "redbull can", "apple"]
+                cnt = 0
+                for obj in obj_list:
+                    if obj in lang:
+                        cnt += 1
+                if cnt == 2:
+                    return True
+                
+                obj_list = ["sponge", "blue plastic bottle", "7up can"]
+                cnt = 0
+                for obj in obj_list:
+                    if obj in lang:
+                        cnt += 1
+                if cnt == 2:
+                    return True
+
+                obj_list = ["orange", "pepsi can", "redbull can"]
+                cnt = 0
+                for obj in obj_list:
+                    if obj in lang:
+                        cnt += 1
+                if cnt == 2:
+                    return True
+                
+                return False
+            if ('open' in lang or 'close' in lang) and 'drawer' in lang:
+                for noun in ['top', 'middle', 'bottom']:
+                    if noun in lang:
+                        return True
+                return False
+
+
+            return False
+
+        
+        lang_list_rt = json.load(open('dataset_stats/fractal20220817_data.json', 'r'))
+        lang_list_bridge = {}
+
+        lang_list = list(lang_list_bridge.keys()) + list(lang_list_rt.keys())
+        lang_list = [_ for _ in lang_list if language_filter(_)]
+        print(lang_list)
+
+        def tf_lang_filter(x):
+            flag = None
+            for lang in lang_list:
+                if flag is None:
+                    flag = tf.math.reduce_any(x["task"]["language_instruction"] == lang)
+                else:
+                    flag = tf.math.logical_or(flag, tf.math.reduce_any(x["task"]["language_instruction"] == lang))
+            return flag
+        
+        dataset = dataset.filter(lambda x: tf_lang_filter(x))
+
     dataset = dataset.traj_map(traj_transforms.add_pad_mask_dict, num_parallel_calls)
 
     # updates the "task" dict
@@ -333,14 +420,25 @@ def apply_trajectory_transforms(
 
     # chunks observations and actions, giving them a new axis at index 1 of size `window_size` and
     # `window_size + future_action_window_size`, respectively
-    dataset = dataset.traj_map(
-        partial(
-            traj_transforms.chunk_act_obs,
-            window_size=window_size,
-            future_action_window_size=future_action_window_size,
-        ),
-        num_parallel_calls,
-    )
+    if chunk_action:
+        dataset = dataset.traj_map(
+            partial(
+                traj_transforms.new_chunk_act_obs,
+                window_size=window_size,
+                future_action_window_size=future_action_window_size,
+                left_pad=left_pad,
+                window_sample=window_sample
+            ),
+            num_parallel_calls,
+        )
+    else:
+        dataset = dataset.traj_map(
+            partial(
+                traj_transforms.chunk_as_episode,
+                frame_num=frame_num
+            ),
+            num_parallel_calls,
+        )
 
     if train and subsample_length is not None:
         dataset = dataset.traj_map(
@@ -466,6 +564,7 @@ def make_interleaved_dataset(
     balance_weights: bool = False,
     traj_transform_threads: Optional[int] = None,
     traj_read_threads: Optional[int] = None,
+    filter_langs=False
 ) -> dl.DLataset:
     """
     Creates an interleaved dataset from list of dataset configs (kwargs). Returns a dataset of batched frames.
@@ -556,7 +655,13 @@ def make_interleaved_dataset(
             **traj_transform_kwargs,
             num_parallel_calls=threads,
             train=train,
-        ).flatten(num_parallel_calls=threads)
+            filter_langs=filter_langs
+        )
+        if traj_transform_kwargs.get('chunk_action', True):
+            dataset = dataset.flatten(num_parallel_calls=threads)
+        else:
+            dataset.is_flattened = True
+
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
         datasets.append(dataset)
 
